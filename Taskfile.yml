@@ -1,0 +1,879 @@
+version: '3'
+
+vars:
+  INSTANCE_NAME: SMC
+  BASE_DATOS: BSD
+  POOL_NAME: default
+  #Usuario y contrasela de SMC
+  US_SMC: smcadmin
+  PASS_SMC: admin123
+
+  #Usuario y contrasela de BSD
+  US_BSD: dbadmin
+  PASS_BSD: admin123
+
+#Nomnbre del dominio
+  DOMAIN: "smc.local"
+
+#Usuario y contraseña para FTP
+  USER_FTP: "smc_admin"
+  PASS_FTP: "admin123"
+
+#Ruta enjaulada de los usuarios para FTP
+  CHROOT_PATH: "/srv/sftp"
+
+#Contraseñas para Nextcloud para Base de Datos y Admin en la pagina web
+  NC_DB_USER: "nc_admin"
+  NC_DB_PASS: "admin123"
+  NC_ADMIN_USER: "admin"
+  NC_ADMIN_PASS: "admin123"
+
+tasks:
+  default:
+    silent: true
+    cmds:
+      - echo "{{.INSTANCE_NAME}}"
+
+  init:
+    desc: Creates instances and provisions them
+    status:
+      - incus list name={{.INSTANCE_NAME}} | grep {{.INSTANCE_NAME}}
+      - incus list name={{.BASE_DATOS}} | grep {{.BASE_DATOS}}
+    cmds:
+      - incus launch images:ubuntu/24.04 {{.INSTANCE_NAME}} --network asirnetwork
+      - incus launch images:ubuntu/24.04 {{.BASE_DATOS}} --network asirnetwork
+      - bash -c 'until incus exec {{.INSTANCE_NAME}} -- true 2>/dev/null; do echo "Esperando agente en {{.INSTANCE_NAME}}..."; sleep 5; done'
+      - bash -c 'until incus exec {{.BASE_DATOS}} -- true 2>/dev/null; do echo "Esperando agente en {{.BASE_DATOS}}..."; sleep 5; done'
+
+  setup:
+    internal: false
+    cmds: []
+
+  provision:
+    desc: Instala repositorios y paquetería
+    cmds:
+      # --- SMC ---
+      - incus exec {{.INSTANCE_NAME}} -- bash -c 'rm -rf /var/lib/apt/lists/* && apt-get clean'
+      - incus exec {{.INSTANCE_NAME}} -- sed -i 's/http:\/\/archive.ubuntu.com/http:\/\/main.archive.ubuntu.com/g' /etc/apt/sources.list
+      - incus exec {{.INSTANCE_NAME}} -- bash -c 'apt-get update'
+      - incus exec {{.INSTANCE_NAME}} -- bash -c 'apt-get install -y apt-transport-https software-properties-common wget gnupg'
+      - incus exec {{.INSTANCE_NAME}} -- bash -c 'mkdir -p /etc/apt/keyrings/'
+      - incus exec {{.INSTANCE_NAME}} -- bash -c 'wget -q -O - https://apt.grafana.com/gpg.key | gpg --dearmor | tee /etc/apt/keyrings/grafana.gpg > /dev/null'
+      - incus exec {{.INSTANCE_NAME}} -- bash -c 'echo "deb [signed-by=/etc/apt/keyrings/grafana.gpg] https://apt.grafana.com stable main" | tee /etc/apt/sources.list.d/grafana.list'
+      - incus exec {{.INSTANCE_NAME}} -- bash -c 'apt-get update'
+      - incus exec {{.INSTANCE_NAME}} -- bash -c 'apt-get install -y grafana prometheus prometheus-blackbox-exporter apache2 unzip curl'
+
+      # --- BSD ---
+      - incus exec {{.BASE_DATOS}} -- bash -c 'rm -rf /var/lib/apt/lists/* && apt-get clean'
+      - incus exec {{.BASE_DATOS}} -- sed -i 's/http:\/\/archive.ubuntu.com/http:\/\/main.archive.ubuntu.com/g' /etc/apt/sources.list
+      - incus exec {{.BASE_DATOS}} -- bash -c 'apt-get update'
+      - incus exec {{.BASE_DATOS}} -- bash -c 'apt-get install -y mariadb-server prometheus-node-exporter prometheus-mysqld-exporter'
+
+      # --- MYSQL (Bind Mount RAID) ---
+      - incus exec {{.BASE_DATOS}} -- systemctl stop mariadb
+      - incus exec {{.BASE_DATOS}} -- mkdir -p /mnt/raid1/mysql
+      - incus exec {{.BASE_DATOS}} -- chown -R mysql:mysql /mnt/raid1/mysql
+      - incus exec {{.BASE_DATOS}} -- bash -c 'mv /var/lib/mysql/* /mnt/raid1/mysql/' || true
+      - incus exec {{.BASE_DATOS}} -- mount --bind /mnt/raid1/mysql /var/lib/mysql
+      - incus exec {{.BASE_DATOS}} -- bash -c 'grep -q "/var/lib/mysql" /etc/fstab || echo "/mnt/raid1/mysql /var/lib/mysql none bind 0 0" >> /etc/fstab'
+      - incus exec {{.BASE_DATOS}} -- systemctl start mariadb
+
+      # --- USUARIOS ---
+      - incus exec {{.INSTANCE_NAME}} -- bash -c 'id -u {{.US_SMC}} &>/dev/null || useradd -m -s /bin/bash {{.US_SMC}}'
+      - incus exec {{.INSTANCE_NAME}} -- bash -c 'echo "{{.US_SMC}}:{{.PASS_SMC}}" | chpasswd'
+      - incus exec {{.BASE_DATOS}} -- bash -c 'id -u {{.US_BSD}} &>/dev/null || useradd -m -s /bin/bash {{.US_BSD}}'
+      - incus exec {{.BASE_DATOS}} -- bash -c 'echo "{{.US_BSD}}:{{.PASS_BSD}}" | chpasswd'
+
+  db:config:
+    internal: false
+    cmds:
+      # 1. Crea el admin local (dbadmin) usando autenticación por socket (sin pass) para gestión segura desde el SO
+      - incus exec {{.BASE_DATOS}} -- mariadb -u root -p'{{.PASS_BSD}}' -e "CREATE OR REPLACE USER '{{.US_BSD}}'@'localhost' IDENTIFIED VIA unix_socket; GRANT ALL PRIVILEGES ON *.* TO '{{.US_BSD}}'@'localhost' WITH GRANT OPTION; FLUSH PRIVILEGES;"
+      # 2. Habilita acceso nativo para root y crea el usuario 'exporter' con permisos restringidos (solo lectura) para Prometheus
+      - incus exec {{.BASE_DATOS}} -- mariadb -u root -p'{{.PASS_BSD}}' -e "ALTER USER 'root'@'localhost' IDENTIFIED VIA mysql_native_password USING PASSWORD('{{.PASS_BSD}}'); FLUSH PRIVILEGES; CREATE OR REPLACE USER 'exporter'@'%' IDENTIFIED BY '{{.PASS_BSD}}'; GRANT PROCESS, REPLICATION CLIENT, SELECT ON *.* TO 'exporter'@'%'; FLUSH PRIVILEGES;"
+      # 3. Seguridad: elimina usuarios anónimos, BD de test y bloquea el acceso remoto de root
+      - incus exec {{.BASE_DATOS}} -- mariadb -u root -p'{{.PASS_BSD}}' -e "DELETE FROM mysql.user WHERE User=''; DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1'); DROP DATABASE IF EXISTS test; DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%'; FLUSH PRIVILEGES;"
+
+  monitor:config:
+    desc: Configura monitorización BASE
+    deps: [db:config]
+    vars:
+      MY_CNF: |
+        [client]
+        user=exporter
+        password={{.PASS_BSD}}
+
+      PROMETHEUS_CONF: |
+        global:
+          scrape_interval: 15s
+        scrape_configs:
+          - job_name: 'prometheus'
+            static_configs:
+              - targets: ['localhost:9090']
+          - job_name: 'node'
+            static_configs:
+              - targets: ['localhost:9100']
+                labels:
+                  instance: 'smc.smc.local'
+              - targets: ['bsd.smc.local:9100']
+                labels:
+                  instance: 'bsd.smc.local'
+          - job_name: 'mariadb_bsd'
+            static_configs:
+              - targets: ['bsd.smc.local:9104']
+                labels:
+                  instance: 'bsd.smc.local'
+          - job_name: 'blackbox_http'
+            metrics_path: /probe
+            params:
+              module: [http_2xx]
+            static_configs:
+              - targets:
+                - http://localhost
+                - https://google.com
+            relabel_configs:
+              - source_labels: [__address__]
+                target_label: __param_target
+              - source_labels: [__param_target]
+                target_label: instance
+              - target_label: __address__
+                replacement: localhost:9115
+
+      BLACKBOX_CONF: |
+        modules:
+          http_2xx:
+            prober: http
+            timeout: 5s
+            http:
+              valid_http_versions: ['HTTP/1.1', 'HTTP/2.0']
+              method: GET
+              preferred_ip_protocol: "ip4"
+              ip_protocol_fallback: false
+          icmp:
+            prober: icmp
+
+    cmds:
+      - echo "{{.MY_CNF}}" > .my.cnf_temp
+      - incus file push .my.cnf_temp {{.BASE_DATOS}}/var/lib/prometheus/.my.cnf
+      - rm .my.cnf_temp
+      - incus exec {{.BASE_DATOS}} -- chmod 600 /var/lib/prometheus/.my.cnf
+      - incus exec {{.BASE_DATOS}} -- chown prometheus:prometheus /var/lib/prometheus/.my.cnf
+      - incus exec {{.BASE_DATOS}} -- bash -c 'echo "ARGS=\"--config.my-cnf=/var/lib/prometheus/.my.cnf\"" > /etc/default/prometheus-mysqld-exporter'
+      - incus exec {{.BASE_DATOS}} -- systemctl restart prometheus-mysqld-exporter
+
+      - echo "{{.BLACKBOX_CONF}}" > blackbox_temp.yml
+      - incus file push blackbox_temp.yml {{.INSTANCE_NAME}}/etc/prometheus/blackbox.yml
+      - rm blackbox_temp.yml
+      - incus exec {{.INSTANCE_NAME}} -- systemctl restart prometheus-blackbox-exporter
+
+      - echo "{{.PROMETHEUS_CONF}}" > prometheus_temp.yml
+      - incus file push prometheus_temp.yml {{.INSTANCE_NAME}}/etc/prometheus/prometheus.yml
+      - rm prometheus_temp.yml
+      - incus exec {{.INSTANCE_NAME}} -- chown prometheus:prometheus /etc/prometheus/prometheus.yml
+
+      - incus exec {{.INSTANCE_NAME}} -- systemctl restart prometheus
+      - echo "Monitorización base restaurada con DNS."
+
+  monitor:alerts:
+    desc: Activación de las alertas
+    vars:
+      # Definimos la configuración de Prometheus INCLUYENDO las reglas
+      PROMETHEUS_CONF_WITH_ALERTS: |
+        global:
+          scrape_interval: 15s
+        rule_files:
+          - "/etc/prometheus/alerts.yml"
+        scrape_configs:
+          - job_name: 'prometheus'
+            static_configs:
+              - targets: ['localhost:9090']
+          - job_name: 'node'
+            static_configs:
+              - targets: ['localhost:9100']
+                labels:
+                  instance: '{{.INSTANCE_NAME}}'
+              - targets: ['BSD_PLACEHOLDER:9100']
+                labels:
+                  instance: 'BSD_PLACEHOLDER'
+          - job_name: 'mariadb_bsd'
+            static_configs:
+              - targets: ['BSD_PLACEHOLDER:9104']
+                labels:
+                  instance: 'BSD_PLACEHOLDER'
+          - job_name: 'blackbox_http'
+            metrics_path: /probe
+            params:
+              module: [http_2xx]
+            static_configs:
+              - targets:
+                - http://localhost
+                - http://localhost/nextcloud
+            relabel_configs:
+              - source_labels: [__address__]
+                target_label: __param_target
+              - source_labels: [__param_target]
+                target_label: instance
+              - target_label: __address__
+                replacement: localhost:9115
+
+    cmds:
+      # 1. Creación de el archivo de alertas
+      - |
+        incus exec {{.INSTANCE_NAME}} -- bash -c "cat << 'EOF' > /etc/prometheus/alerts.yml
+        groups:
+          - name: basic_alerts
+            rules:
+              - alert: InstanceDown
+                expr: up == 0
+                for: 1m
+                labels:
+                  severity: critical
+                annotations:
+                  summary: 'Instancia Caida'
+                  description: 'Uno de los servidores ha dejado de responder.'
+
+              - alert: ProbeFailed
+                expr: probe_success == 0
+                for: 1m
+                labels:
+                  severity: critical
+                annotations:
+                  summary: 'Web o Google inaccesibles'
+                  description: 'Blackbox exporter ha detectado un fallo.'
+
+              - alert: HighCpuLoad
+                expr: 100 - (avg by(instance) (rate(node_cpu_seconds_total{mode=\"idle\"}[2m])) * 100) > 80
+                for: 2m
+                labels:
+                  severity: warning
+                annotations:
+                  summary: 'Carga de CPU Alta'
+                  description: 'La CPU ha superado el 80%.'
+        EOF"
+
+      # Permisos
+      - incus exec {{.INSTANCE_NAME}} -- chown prometheus:prometheus /etc/prometheus/alerts.yml
+      - incus exec {{.INSTANCE_NAME}} -- chmod 644 /etc/prometheus/alerts.yml
+
+      # 2. Actualizar Prometheus para leer el archivo de prometheus_alerts_temp.yml
+      - echo "{{.PROMETHEUS_CONF_WITH_ALERTS}}" > prometheus_alerts_temp.yml
+      - incus file push prometheus_alerts_temp.yml {{.INSTANCE_NAME}}/etc/prometheus/prometheus.yml
+      - rm prometheus_alerts_temp.yml
+      - incus exec {{.INSTANCE_NAME}} -- sed -i 's/BSD_PLACEHOLDER/{{.BASE_DATOS}}/g' /etc/prometheus/prometheus.yml
+      - incus exec {{.INSTANCE_NAME}} -- chown prometheus:prometheus /etc/prometheus/prometheus.yml
+
+      # 3. Reiniciar servicio
+      - incus exec {{.INSTANCE_NAME}} -- systemctl restart prometheus
+      - echo "Alertas cargadas. Si Grafana sigue mostrando datos, todo ha ido bien."
+
+  grafana:config:
+    desc: Configura Grafana (IGUAL A LA VERSIÓN QUE FUNCIONA)
+    deps: [monitor:config]
+    vars:
+      DATASOURCE_B64: "YXBpVmVyc2lvbjogMQpkYXRhc291cmNlczoKICAtIG5hbWU6IFByb21ldGhldXMKICAgIHR5cGU6IHByb21ldGhldXMKICAgIHVybDogaHR0cDovL2xvY2FsaG9zdDo5MDkwCiAgICBpc0RlZmF1bHQ6IHRydWU="
+      PROVIDER_B64: "YXBpVmVyc2lvbjogMQpwcm92aWRlcnM6CiAgLSBuYW1lOiAnZGVmYXVsdCcKICAgIG9yZ0lkOiAxCiAgICBmb2xkZXI6ICcnCiAgICB0eXBlOiBmaWxlCiAgICBvcHRpb25zOgogICAgICBwYXRoOiAvdmFyL2xpYi9ncmFmYW5hL2Rhc2hib2FyZHM="
+    cmds:
+      - incus exec {{.INSTANCE_NAME}} -- mkdir -p /etc/grafana/provisioning/datasources
+      - incus exec {{.INSTANCE_NAME}} -- mkdir -p /etc/grafana/provisioning/dashboards
+      - incus exec {{.INSTANCE_NAME}} -- mkdir -p /var/lib/grafana/dashboards
+
+      # Provisioning
+      - incus exec {{.INSTANCE_NAME}} -- bash -c 'echo "{{.DATASOURCE_B64}}" | base64 -d > /etc/grafana/provisioning/datasources/prometheus.yaml'
+      - incus exec {{.INSTANCE_NAME}} -- bash -c 'echo "{{.PROVIDER_B64}}" | base64 -d > /etc/grafana/provisioning/dashboards/default.yaml'
+
+      # Dashboards
+      # 1. MySQL Overview (ID 7362)
+      - incus exec {{.INSTANCE_NAME}} -- bash -c 'curl -o /var/lib/grafana/dashboards/mysql-overview.json https://grafana.com/api/dashboards/7362/revisions/latest/download'
+      - incus exec {{.INSTANCE_NAME}} -- sed -i 's/${DS_PROMETHEUS}/Prometheus/g' /var/lib/grafana/dashboards/mysql-overview.json
+
+      # 2. Node Exporter Full (ID 1860)
+      - incus exec {{.INSTANCE_NAME}} -- bash -c 'curl -o /var/lib/grafana/dashboards/node-exporter-full.json https://grafana.com/api/dashboards/1860/revisions/latest/download'
+      - incus exec {{.INSTANCE_NAME}} -- sed -i 's/${DS_PROMETHEUS}/Prometheus/g' /var/lib/grafana/dashboards/node-exporter-full.json
+
+      # 3. Blackbox (ID 7587)
+      - incus exec {{.INSTANCE_NAME}} -- bash -c 'curl -o /var/lib/grafana/dashboards/blackbox-ping.json https://grafana.com/api/dashboards/7587/revisions/latest/download'
+      - incus exec {{.INSTANCE_NAME}} -- sed -i 's/${DS_SIGNCL-PROMETHEUS}/Prometheus/g' /var/lib/grafana/dashboards/blackbox-ping.json
+
+      # Permisos y Restart
+      - incus exec {{.INSTANCE_NAME}} -- chown -R grafana:grafana /etc/grafana/provisioning
+      - incus exec {{.INSTANCE_NAME}} -- chown -R grafana:grafana /var/lib/grafana/dashboards
+      - incus exec {{.INSTANCE_NAME}} -- systemctl restart grafana-server
+
+  raid:config:
+    desc: Crea RAID 1
+    cmds:
+      - incus storage volume create {{.POOL_NAME}} raid_disk_a size=10GiB --type=block || true
+      - incus storage volume create {{.POOL_NAME}} raid_disk_b size=10GiB --type=block || true
+      - incus config device add {{.BASE_DATOS}} disk_a disk pool={{.POOL_NAME}} source=raid_disk_a || true
+      - incus config device add {{.BASE_DATOS}} disk_b disk pool={{.POOL_NAME}} source=raid_disk_b || true
+      - incus exec {{.BASE_DATOS}} -- apt-get update
+      - incus exec {{.BASE_DATOS}} -- apt-get install -y mdadm
+      - incus exec {{.BASE_DATOS}} -- bash -c 'grep -q md0 /proc/mdstat || yes | mdadm --create --verbose /dev/md0 --level=1 --raid-devices=2 /dev/sdb /dev/sdc --force'
+      - incus exec {{.BASE_DATOS}} -- bash -c 'blkid /dev/md0 || mkfs.ext4 -F /dev/md0'
+      - incus exec {{.BASE_DATOS}} -- mkdir -p /mnt/raid1
+      - incus exec {{.BASE_DATOS}} -- bash -c 'mountpoint -q /mnt/raid1 || mount /dev/md0 /mnt/raid1'
+      - incus exec {{.BASE_DATOS}} -- bash -c 'grep -q "/mnt/raid1" /etc/fstab || echo "UUID=$(blkid -s UUID -o value /dev/md0) /mnt/raid1 ext4 defaults 0 0" >> /etc/fstab'
+      - incus exec {{.BASE_DATOS}} -- bash -c 'mdadm --detail --scan >> /etc/mdadm/mdadm.conf'
+      - incus exec {{.BASE_DATOS}} -- update-initramfs -u
+
+  web:deploy:
+    desc: Despliega web Agency
+    cmds:
+      - incus exec {{.INSTANCE_NAME}} -- bash -c 'apt-get update && apt-get install -y apache2 unzip'
+      - incus exec {{.INSTANCE_NAME}} -- rm -f /var/www/html/index.html
+      - incus exec {{.INSTANCE_NAME}} -- bash -c 'curl -L -o /tmp/agency.zip https://github.com/startbootstrap/startbootstrap-agency/archive/gh-pages.zip'
+      - incus exec {{.INSTANCE_NAME}} -- unzip -o /tmp/agency.zip -d /tmp/
+      - incus exec {{.INSTANCE_NAME}} -- bash -c 'cp -r /tmp/startbootstrap-agency-gh-pages/* /var/www/html/'
+      - incus exec {{.INSTANCE_NAME}} -- chown -R www-data:www-data /var/www/html
+      - incus exec {{.INSTANCE_NAME}} -- chmod -R 755 /var/www/html
+      - incus exec {{.INSTANCE_NAME}} -- rm -rf /tmp/agency.zip /tmp/startbootstrap-agency-gh-pages
+      - incus exec {{.INSTANCE_NAME}} -- systemctl restart apache2
+
+  nextcloud:deploy:
+    desc: Instala Nextcloud usando carpetas compartidas de Incus
+    cmds:
+      - echo "Configurando Base de Datos para Nextcloud..."
+      - incus exec {{.BASE_DATOS}} -- mariadb -u root -p'{{.PASS_BSD}}' -e "CREATE DATABASE IF NOT EXISTS nextcloud CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;"
+      - incus exec {{.BASE_DATOS}} -- mariadb -u root -p'{{.PASS_BSD}}' -e "CREATE OR REPLACE USER '{{.NC_DB_USER}}'@'%' IDENTIFIED BY '{{.NC_DB_PASS}}';"
+      - incus exec {{.BASE_DATOS}} -- mariadb -u root -p'{{.PASS_BSD}}' -e "GRANT ALL PRIVILEGES ON nextcloud.* TO '{{.NC_DB_USER}}'@'%'; FLUSH PRIVILEGES;"
+      - incus exec {{.BASE_DATOS}} -- sed -i 's/bind-address            = 127.0.0.1/bind-address            = 0.0.0.0/g' /etc/mysql/mariadb.conf.d/50-server.cnf
+      - incus exec {{.BASE_DATOS}} -- systemctl restart mariadb
+
+      - echo "Creando almacenamiento compartido en el HOST (AWS)..."
+      - bash -c 'mkdir -p /tmp/nc_shared_storage'
+
+      - echo "Preparando SMC..."
+      - incus exec {{.INSTANCE_NAME}} -- bash -c 'apt-get update && apt-get install -y php php-gd php-mysql php-curl php-mbstring php-intl php-gmp php-bcmath php-xml php-imagick php-zip unzip apache2 libapache2-mod-php'
+      - incus exec {{.INSTANCE_NAME}} -- rm -rf /var/www/html/nextcloud
+      - incus exec {{.INSTANCE_NAME}} -- bash -c 'curl -L -o /tmp/nextcloud.zip https://download.nextcloud.com/server/releases/latest.zip'
+      - incus exec {{.INSTANCE_NAME}} -- unzip -q -o /tmp/nextcloud.zip -d /var/www/html/
+      - incus exec {{.INSTANCE_NAME}} -- rm /tmp/nextcloud.zip
+      - incus exec {{.INSTANCE_NAME}} -- mkdir -p /var/www/html/nextcloud/data
+
+      - echo "Inyectando carpeta compartida de Incus en SMC..."
+      # La magia de shift=true traduce el usuario root del host al usuario www-data del contenedor automáticamente
+      - incus config device add {{.INSTANCE_NAME}} nc_data disk source=/tmp/nc_shared_storage path=/var/www/html/nextcloud/data shift=true || true
+      - incus exec {{.INSTANCE_NAME}} -- chown -R www-data:www-data /var/www/html/nextcloud
+
+      - echo "Instalando Nextcloud..."
+      - incus exec {{.INSTANCE_NAME}} -- bash -c 'sudo -u www-data php /var/www/html/nextcloud/occ maintenance:install --database "mysql" --database-name "nextcloud" --database-user "{{.NC_DB_USER}}" --database-pass "{{.NC_DB_PASS}}" --database-host "bsd.smc.local" --admin-user "{{.NC_ADMIN_USER}}" --admin-pass "{{.NC_ADMIN_PASS}}" --data-dir "/var/www/html/nextcloud/data"'
+
+      - incus exec {{.INSTANCE_NAME}} -- bash -c 'sudo -u www-data php /var/www/html/nextcloud/occ config:system:set trusted_domains 1 --value=nextcloud.smc.local'
+      - incus exec {{.INSTANCE_NAME}} -- bash -c 'sudo -u www-data php /var/www/html/nextcloud/occ config:system:set trusted_domains 2 --value=smc.smc.local'
+      - incus exec {{.INSTANCE_NAME}} -- bash -c 'IP=$(hostname -I | cut -d" " -f1); sudo -u www-data php /var/www/html/nextcloud/occ config:system:set trusted_domains 3 --value=$IP'
+      - incus exec {{.INSTANCE_NAME}} -- systemctl restart apache2
+      - 'echo "Nextcloud listo en http://nextcloud.smc.local/nextcloud"'
+
+  monitor:logs:
+    desc: Instala Logs y configura el Dashboard (Corregido para Ubuntu 24.04)
+    cmds:
+      # ==========================================
+      # 1. INSTALAR LOKI EN SMC
+      # ==========================================
+      - echo "Revisando instalación de Loki en SMC..."
+      - incus exec {{.INSTANCE_NAME}} -- bash -c 'apt-get update && apt-get install -y loki promtail'
+
+      # Configuración de Loki
+      - |
+        incus exec {{.INSTANCE_NAME}} -- bash -c 'echo "auth_enabled: false
+        server:
+          http_listen_port: 3100
+        common:
+          path_prefix: /tmp/loki
+          storage:
+            filesystem:
+              chunks_directory: /tmp/loki/chunks
+              rules_directory: /tmp/loki/rules
+          replication_factor: 1
+          ring:
+            instance_addr: 127.0.0.1
+            kvstore:
+              store: inmemory
+        schema_config:
+          configs:
+            - from: 2020-10-24
+              store: tsdb
+              object_store: filesystem
+              schema: v13
+              index:
+                prefix: index_
+                period: 24h
+        " > /etc/loki/config.yml'
+      - incus exec {{.INSTANCE_NAME}} -- systemctl restart loki
+
+      # ==========================================
+      # 2. CONECTAR GRAFANA CON LOKI
+      # ==========================================
+      - |
+        incus exec {{.INSTANCE_NAME}} -- bash -c 'echo "apiVersion: 1
+        datasources:
+          - name: Loki
+            type: loki
+            access: proxy
+            url: http://localhost:3100
+            jsonData:
+              maxLines: 1000
+        " > /etc/grafana/provisioning/datasources/loki.yaml'
+
+      # ==========================================
+      # 3. CREAR DASHBOARD DE LOGS (Actualizado para DNS)
+      # ==========================================
+      - |
+        incus exec {{.INSTANCE_NAME}} -- bash -c "cat << 'EOF' > /var/lib/grafana/dashboards/loki-logs.json
+        {
+          \"title\": \"Explorador de Logs (Loki)\",
+          \"uid\": \"loki-logs-custom\",
+          \"timezone\": \"browser\",
+          \"schemaVersion\": 16,
+          \"version\": 1,
+          \"panels\": [
+            {
+              \"title\": \"Logs de SMC (Host Principal)\",
+              \"type\": \"logs\",
+              \"datasource\": \"Loki\",
+              \"gridPos\": { \"x\": 0, \"y\": 0, \"w\": 24, \"h\": 10 },
+              \"targets\": [ { \"expr\": \"{host=\\\"smc.smc.local\\\"}\", \"refId\": \"A\" } ]
+            },
+            {
+              \"title\": \"Logs de BSD (Base de Datos)\",
+              \"type\": \"logs\",
+              \"datasource\": \"Loki\",
+              \"gridPos\": { \"x\": 0, \"y\": 10, \"w\": 24, \"h\": 10 },
+              \"targets\": [ { \"expr\": \"{host=\\\"bsd.smc.local\\\"}\", \"refId\": \"A\" } ]
+            },
+            {
+              \"title\": \"Todos los Logs (Global)\",
+              \"type\": \"logs\",
+              \"datasource\": \"Loki\",
+              \"gridPos\": { \"x\": 0, \"y\": 20, \"w\": 24, \"h\": 10 },
+              \"targets\": [ { \"expr\": \"{job=\\\"varlogs\\\"}\", \"refId\": \"A\" } ]
+            }
+          ]
+        }
+        EOF"
+
+      - incus exec {{.INSTANCE_NAME}} -- chown grafana:grafana /var/lib/grafana/dashboards/loki-logs.json
+      - incus exec {{.INSTANCE_NAME}} -- systemctl restart grafana-server
+
+      # ==========================================
+      # 4. CONFIGURAR PROMTAIL EN SMC (Actualizado para DNS)
+      # ==========================================
+      - |
+        incus exec {{.INSTANCE_NAME}} -- bash -c 'echo "server:
+          http_listen_port: 9080
+          grpc_listen_port: 0
+        positions:
+          filename: /tmp/positions.yaml
+        clients:
+          - url: http://localhost:3100/loki/api/v1/push
+        scrape_configs:
+        - job_name: system
+          static_configs:
+          - targets:
+              - localhost
+            labels:
+              job: varlogs
+              host: smc.smc.local
+              __path__: /var/log/*log
+        " > /etc/promtail/config.yml'
+      - echo "Revisando instalación de Loki en SMC..."
+      - incus exec {{.INSTANCE_NAME}} -- bash -c 'apt-get update && apt-get install -y loki promtail'
+      - incus exec {{.INSTANCE_NAME}} -- usermod -aG adm promtail
+      - incus exec {{.INSTANCE_NAME}} -- systemctl restart promtail
+
+      # ==========================================
+      # 5. CONFIGURAR PROMTAIL EN BSD USANDO DNS
+      # ==========================================
+      - echo "Configurando Promtail en BSD..."
+      - incus exec {{.BASE_DATOS}} -- bash -c 'apt-get install -y apt-transport-https software-properties-common wget gnupg' || true
+      - incus exec {{.BASE_DATOS}} -- bash -c 'mkdir -p /etc/apt/keyrings/'
+      - 'incus exec {{.BASE_DATOS}} -- bash -c "wget -q -O - https://apt.grafana.com/gpg.key | gpg --dearmor | tee /etc/apt/keyrings/grafana.gpg > /dev/null"'
+      - 'incus exec {{.BASE_DATOS}} -- bash -c "echo \"deb [signed-by=/etc/apt/keyrings/grafana.gpg] https://apt.grafana.com stable main\" | tee /etc/apt/sources.list.d/grafana.list"'
+      - incus exec {{.BASE_DATOS}} -- bash -c 'apt-get update && apt-get install -y promtail'
+
+      # Fíjate cómo apuntamos a loki.smc.local directamente, ¡sin txt intermedios!
+      - |
+        incus exec {{.BASE_DATOS}} -- bash -c 'echo "server:
+          http_listen_port: 9080
+          grpc_listen_port: 0
+        positions:
+          filename: /tmp/positions.yaml
+        clients:
+          - url: http://loki.smc.local:3100/loki/api/v1/push
+        scrape_configs:
+        - job_name: system
+          static_configs:
+          - targets:
+              - localhost
+            labels:
+              job: varlogs
+              host: bsd.smc.local
+              __path__: /var/log/*log
+        " > /etc/promtail/config.yml'
+      - incus exec {{.BASE_DATOS}} -- bash -c 'apt-get update && apt-get install -y promtail'
+      - incus exec {{.BASE_DATOS}} -- usermod -aG adm promtail
+      - incus exec {{.BASE_DATOS}} -- systemctl restart promtail
+
+
+  backup:config:
+    desc: Configura scripts de Backup usando carpetas compartidas
+    cmds:
+      - echo "Creando carpeta de backups en el HOST (AWS)..."
+      - bash -c 'mkdir -p /tmp/backups_shared'
+
+      - echo "Inyectando carpeta en BSD y SMC..."
+      - incus config device add {{.BASE_DATOS}} backups_disk disk source=/tmp/backups_shared path=/mnt/backups shift=true || true
+      - incus config device add {{.INSTANCE_NAME}} backups_disk disk source=/tmp/backups_shared path=/mnt/backups shift=true || true
+
+      - |
+        incus exec {{.BASE_DATOS}} -- bash -c 'cat <<EOF > /usr/local/bin/backup_db.sh
+        #!/bin/bash
+        DATE=\$(date +%F)
+        BACKUP_DIR="/mnt/backups"
+        mariadb-dump -u root -p{{.PASS_BSD}} --all-databases > \$BACKUP_DIR/db_full_\$DATE.sql
+        gzip -f \$BACKUP_DIR/db_full_\$DATE.sql
+        find \$BACKUP_DIR -name "db_full_*.sql.gz" -mtime +7 -delete
+        EOF'
+      - incus exec {{.BASE_DATOS}} -- chmod +x /usr/local/bin/backup_db.sh
+      - incus exec {{.BASE_DATOS}} -- bash -c 'ln -sf /usr/local/bin/backup_db.sh /etc/cron.daily/backup_db'
+
+      - |
+        incus exec {{.INSTANCE_NAME}} -- bash -c 'cat <<EOF > /usr/local/bin/backup_web.sh
+        #!/bin/bash
+        DATE=\$(date +%F)
+        DEST="/mnt/backups"
+        tar -czf \$DEST/smc_web_config_\$DATE.tar.gz /var/www/html /etc/prometheus /etc/grafana
+        find \$DEST -name "smc_web_config_*.tar.gz" -mtime +7 -delete
+        EOF'
+      - incus exec {{.INSTANCE_NAME}} -- chmod +x /usr/local/bin/backup_web.sh
+      - incus exec {{.INSTANCE_NAME}} -- bash -c 'ln -sf /usr/local/bin/backup_web.sh /etc/cron.daily/backup_web'
+
+
+  ftp:setup:
+    desc: Configura SFTP con permisos diferenciados (Admin y Usuario Chroot)
+    cmds:
+      # 1. Crear grupo para usuarios limitados y estructura de directorios
+      - incus exec {{.INSTANCE_NAME}} -- groupadd -f sftp_users
+      - incus exec {{.INSTANCE_NAME}} -- mkdir -p {{.CHROOT_PATH}}/{{.USER_FTP}}/incoming
+
+      # 2. Crear usuario limitado (sin acceso a shell para mayor seguridad)
+      - incus exec {{.INSTANCE_NAME}} -- bash -c "id -u {{.USER_FTP}} &>/dev/null || useradd -g sftp_users -d /incoming -s /usr/sbin/nologin {{.USER_FTP}}"
+      - incus exec {{.INSTANCE_NAME}} -- bash -c 'echo "{{.USER_FTP}}:{{.PASS_FTP}}" | chpasswd'
+
+      # 3. Configurar permisos de la "Jaula Chroot" (Propiedad de root obligatoria)
+      - incus exec {{.INSTANCE_NAME}} -- chown root:root {{.CHROOT_PATH}}
+      - incus exec {{.INSTANCE_NAME}} -- chown root:root {{.CHROOT_PATH}}/{{.USER_FTP}}
+      - incus exec {{.INSTANCE_NAME}} -- chmod 755 {{.CHROOT_PATH}}/{{.USER_FTP}}
+
+      # 4. Configurar el directorio de subida donde SÍ tiene permisos el usuario
+      - incus exec {{.INSTANCE_NAME}} -- chown {{.USER_FTP}}:sftp_users {{.CHROOT_PATH}}/{{.USER_FTP}}/incoming
+
+      # 5. Modificar sshd_config para aplicar la restricción por grupo
+      - |
+        incus exec {{.INSTANCE_NAME}} -- bash -c "grep -q 'Match Group sftp_users' /etc/ssh/sshd_config || cat <<EOF >> /etc/ssh/sshd_config
+
+        # Configuración SFTP Diferenciada
+        Match Group sftp_users
+            ChrootDirectory {{.CHROOT_PATH}}/%u
+            ForceCommand internal-sftp
+            AllowTcpForwarding no
+            X11Forwarding no
+        EOF"
+
+      # 6. Reiniciar servicio
+      - incus exec {{.INSTANCE_NAME}} -- systemctl restart ssh
+      - echo "Servicio SFTP configurado. Admin ({{.US_SMC}}) tiene acceso total, {{.USER_FTP}} está enjaulado en /incoming."
+
+  users:script:
+    desc: Instala script de automatización de creación de usuarios
+    cmds:
+      - echo "Desplegando script de gestión de usuarios en {{.INSTANCE_NAME}}..."
+      # Usamos 'EOF' entre comillas simples para evitar que el Taskfile interprete las variables $ del bash
+      - |
+        incus exec {{.INSTANCE_NAME}} -- bash -c "cat << 'EOF' > /usr/local/bin/gestion_usuarios.sh
+        #!/bin/bash
+
+        # Script de Automatización de Usuarios - Fase 3
+        # Uso: ./gestion_usuarios.sh -u nombre_usuario [-g grupo]
+
+        # Colorines visuales
+        GREEN='\033[0;32m'
+        RED='\033[0;31m'
+        NC='\033[0m'
+
+        # 1. Comprobar permisos de root
+        if [ \"\$(id -u)\" -ne 0 ]; then
+            echo -e \"\${RED}Error: Este script debe ejecutarse con sudo.\${NC}\"
+            exit 1
+        fi
+
+        # 2. Función de ayuda
+        usage() {
+            echo \"Uso: \$0 -u <usuario> [-g <grupo_adicional>]\"
+            echo \"  -u : Nombre del nuevo usuario (Obligatorio)\"
+            echo \"  -g : Grupo secundario al que añadirlo (Opcional)\"
+            exit 1
+        }
+
+        USERNAME=\"\"
+        GROUP=\"\"
+
+        # 3. Procesamiento de argumentos (flags)
+        while getopts \":u:g:\" opt; do
+          case \${opt} in
+            u) USERNAME=\${OPTARG} ;;
+            g) GROUP=\${OPTARG} ;;
+            *) usage ;;
+          esac
+        done
+
+        if [ -z \"\${USERNAME}\" ]; then
+            usage
+        fi
+
+        # 4. Comprobar si el usuario ya existe
+        if id \"\${USERNAME}\" &>/dev/null; then
+            echo -e \"\${RED}El usuario '\${USERNAME}' ya existe.\${NC}\"
+            exit 1
+        fi
+
+        # 5. Creación del usuario
+        echo \"Creando usuario \${USERNAME}...\"
+        useradd -m -s /bin/bash \"\${USERNAME}\"
+
+        if [ \$? -eq 0 ]; then
+            echo -e \"\${GREEN}Usuario creado correctamente.\${NC}\"
+        else
+            echo -e \"\${RED}Fallo al crear el usuario.\${NC}\"
+            exit 1
+        fi
+
+        # 6. Gestión de grupo opcional
+        if [ ! -z \"\${GROUP}\" ]; then
+            # Crear el grupo si no existe
+            getent group \"\${GROUP}\" || groupadd \"\${GROUP}\"
+            usermod -aG \"\${GROUP}\" \"\${USERNAME}\"
+            echo \"Añadido al grupo: \${GROUP}\"
+        fi
+
+        # 7. Asignar contraseña temporal y forzar cambio
+        TEMP_PASS=\"SMC2026_temp!\"
+        echo \"\${USERNAME}:\${TEMP_PASS}\" | chpasswd
+
+        # 'chage -d 0' fuerza a cambiar la password en el primer login
+        chage -d 0 \"\${USERNAME}\"
+
+        echo \"---------------------------------------------------\"
+        echo -e \"Credenciales temporales:\"
+        echo -e \"Usuario: \${GREEN}\${USERNAME}\${NC}\"
+        echo -e \"Password: \${GREEN}\${TEMP_PASS}\${NC}\"
+        echo -e \"\${RED}El sistema exigirá cambiar la contraseña al entrar.\${NC}\"
+        echo \"---------------------------------------------------\"
+        EOF"
+
+      # Hacemos el script ejecutable
+      - incus exec {{.INSTANCE_NAME}} -- chmod +x /usr/local/bin/gestion_usuarios.sh
+      - 'echo "Script instalado. Prueba: incus exec {{.INSTANCE_NAME}} -- /usr/local/bin/gestion_usuarios.sh -u prueba1"'
+
+  ssh:2fa:
+    desc: Instala 2FA y SSH
+    cmds:
+      - echo "--- Instalando Paquetes ---"
+      - incus exec {{.INSTANCE_NAME}} -- apt-get update
+      - incus exec {{.INSTANCE_NAME}} -- apt-get install -y libpam-google-authenticator openssh-server
+      - incus exec {{.BASE_DATOS}} -- apt-get update
+      - incus exec {{.BASE_DATOS}} -- apt-get install -y libpam-google-authenticator openssh-server
+
+      - echo "--- Iniciando SSH ---"
+      - incus exec {{.INSTANCE_NAME}} -- systemctl unmask ssh || true
+      - incus exec {{.INSTANCE_NAME}} -- systemctl enable ssh
+      - incus exec {{.INSTANCE_NAME}} -- systemctl restart ssh
+      - incus exec {{.BASE_DATOS}} -- systemctl unmask ssh || true
+      - incus exec {{.BASE_DATOS}} -- systemctl enable ssh
+      - incus exec {{.BASE_DATOS}} -- systemctl restart ssh
+      - sleep 10
+
+      - echo "--- Configurando SSHD ---"
+      # SMC
+      - incus exec {{.INSTANCE_NAME}} -- bash -c 'sed -i "s/#KbdInteractiveAuthentication no/KbdInteractiveAuthentication yes/g" /etc/ssh/sshd_config || echo "KbdInteractiveAuthentication yes" >> /etc/ssh/sshd_config'
+      - incus exec {{.INSTANCE_NAME}} -- bash -c 'sed -i "s/KbdInteractiveAuthentication no/KbdInteractiveAuthentication yes/g" /etc/ssh/sshd_config'
+      # BSD
+      - incus exec {{.BASE_DATOS}} -- bash -c 'sed -i "s/#KbdInteractiveAuthentication no/KbdInteractiveAuthentication yes/g" /etc/ssh/sshd_config || echo "KbdInteractiveAuthentication yes" >> /etc/ssh/sshd_config'
+      - incus exec {{.BASE_DATOS}} -- bash -c 'sed -i "s/KbdInteractiveAuthentication no/KbdInteractiveAuthentication yes/g" /etc/ssh/sshd_config'
+
+      - echo "--- Configurando PAM ---"
+      - incus exec {{.INSTANCE_NAME}} -- bash -c 'grep -q "google_authenticator.so" /etc/pam.d/sshd || sed -i "1s/^/auth required pam_google_authenticator.so nullok\n/" /etc/pam.d/sshd'
+      - incus exec {{.BASE_DATOS}} -- bash -c 'grep -q "google_authenticator.so" /etc/pam.d/sshd || sed -i "1s/^/auth required pam_google_authenticator.so nullok\n/" /etc/pam.d/sshd'
+
+      - echo "--- Bloqueando Root ---"
+      - incus exec {{.INSTANCE_NAME}} -- bash -c 'sed -i "s/^#\?PermitRootLogin.*/PermitRootLogin no/" /etc/ssh/sshd_config'
+      - incus exec {{.BASE_DATOS}} -- bash -c 'sed -i "s/^#\?PermitRootLogin.*/PermitRootLogin no/" /etc/ssh/sshd_config'
+
+      - echo "--- Reiniciando Servicios ---"
+      - incus exec {{.INSTANCE_NAME}} -- systemctl restart ssh
+      - incus exec {{.BASE_DATOS}} -- systemctl restart ssh
+
+      - echo "--- Tokens SMC ---"
+      - incus exec {{.INSTANCE_NAME}} -- sudo -u {{.US_SMC}} google-authenticator -t -d -f -r 3 -R 30 -w 3 -q
+      - incus exec {{.INSTANCE_NAME}} -- cat /home/{{.US_SMC}}/.google_authenticator | head -n 1
+
+      - echo "--- Tokens BSD 2FA ---"
+      - incus exec {{.BASE_DATOS}} -- sudo -u {{.US_BSD}} google-authenticator -t -d -f -r 3 -R 30 -w 3 -q
+      - incus exec {{.BASE_DATOS}} -- cat /home/{{.US_BSD}}/.google_authenticator | head -n 1
+
+  dns:setup:
+    desc: Instala y configura servidor DNS Maestro en SMC (Bind9)
+    cmds:
+      - echo "Instalando Bind9 en SMC..."
+      - incus exec {{.INSTANCE_NAME}} -- bash -c 'apt-get update && apt-get install -y bind9 bind9utils bind9-doc dnsutils'
+
+      # 1. Configurar Opciones Globales
+      - |
+        incus exec {{.INSTANCE_NAME}} -- bash -c "cat << 'EOF' > /etc/bind/named.conf.options
+        options {
+            directory \"/var/cache/bind\";
+            recursion yes;
+            allow-query { any; };
+            forwarders {
+                8.8.8.8;
+                1.1.1.1;
+            };
+            dnssec-validation auto;
+            listen-on-v6 { any; };
+        };
+        EOF"
+
+      # 2. Declarar la Zona Local
+      - |
+        incus exec {{.INSTANCE_NAME}} -- bash -c "cat << 'EOF' > /etc/bind/named.conf.local
+        zone \"{{.DOMAIN}}\" {
+            type master;
+            file \"/etc/bind/db.{{.DOMAIN}}\";
+        };
+        EOF"
+
+      # 3. Crear el archivo de Zona desde el HOST (evita errores de escape)
+      - |
+        SMC_IP=$(incus exec {{.INSTANCE_NAME}} -- hostname -I | awk '{print $1}')
+        BSD_IP=$(incus exec {{.BASE_DATOS}} -- hostname -I | awk '{print $1}')
+        cat <<EOF > db.{{.DOMAIN}}.temp
+        \$TTL    604800
+        @       IN      SOA     ns1.{{.DOMAIN}}. admin.{{.DOMAIN}}. (
+                                      2         ; Serial
+                                 604800         ; Refresh
+                                  86400         ; Retry
+                                2419200         ; Expire
+                                 604800 )       ; Negative Cache TTL
+        ;
+        @       IN      NS      ns1.{{.DOMAIN}}.
+        ns1     IN      A       $SMC_IP
+
+        ; Servidores base
+        smc     IN      A       $SMC_IP
+        bsd     IN      A       $BSD_IP
+
+        ; Servicios web y monitorización
+        www         IN      CNAME   smc
+        nextcloud   IN      CNAME   smc
+        grafana     IN      CNAME   smc
+        loki        IN      CNAME   smc
+        prometheus  IN      CNAME   smc
+        EOF
+      - incus file push db.{{.DOMAIN}}.temp {{.INSTANCE_NAME}}/etc/bind/db.{{.DOMAIN}}
+      - rm db.{{.DOMAIN}}.temp
+
+      # 4. Reiniciar Bind9 y comprobar sintaxis
+      - incus exec {{.INSTANCE_NAME}} -- named-checkconf
+      - incus exec {{.INSTANCE_NAME}} -- named-checkzone {{.DOMAIN}} /etc/bind/db.{{.DOMAIN}}
+      - incus exec {{.INSTANCE_NAME}} -- systemctl restart named
+      - incus exec {{.INSTANCE_NAME}} -- systemctl enable named
+
+      # 5. Configurar systemd-resolved inyectando la IP limpia directamente
+      - |
+        SMC_IP=$(incus exec {{.INSTANCE_NAME}} -- hostname -I | awk '{print $1}')
+        incus exec {{.INSTANCE_NAME}} -- bash -c "sed -i \"s/#DNS=/DNS=$SMC_IP/\" /etc/systemd/resolved.conf"
+        incus exec {{.INSTANCE_NAME}} -- bash -c "sed -i \"s/#Domains=/Domains={{.DOMAIN}}/\" /etc/systemd/resolved.conf"
+        incus exec {{.INSTANCE_NAME}} -- systemctl restart systemd-resolved
+
+        incus exec {{.BASE_DATOS}} -- bash -c "sed -i \"s/#DNS=/DNS=$SMC_IP/\" /etc/systemd/resolved.conf"
+        incus exec {{.BASE_DATOS}} -- bash -c "sed -i \"s/#Domains=/Domains={{.DOMAIN}}/\" /etc/systemd/resolved.conf"
+        incus exec {{.BASE_DATOS}} -- systemctl restart systemd-resolved
+
+  destroy:
+    prompt: This is a dangerous command... Do you want to continue?
+    desc: Destroy instance {{.INSTANCE_NAME}} and RAID disks
+    cmds:
+      - incus delete {{.INSTANCE_NAME}} --force
+      - incus delete {{.BASE_DATOS}} --force
+      - incus storage volume delete {{.POOL_NAME}} raid_disk_a || true
+      - incus storage volume delete {{.POOL_NAME}} raid_disk_b || true
+
+  build:
+    desc: Create specific activity files and set up
+    deps: [init]
+    cmds:
+#      - task: raid:config
+      - task: provision
+      - task: dns:setup
+      - task: grafana:config
+      - task: web:deploy
+      - task: nextcloud:deploy
+      - task: monitor:alerts
+      - task: monitor:logs
+      - task: backup:config
+      - task: users:script
+      - task: ssh:2fa
+      - task: ftp:setup
+
+# --- RESUMEN FINAL ---
+      - echo "Recordatorios Finales:"
+      - echo "DNS Maestro configurado. Puedes probar haciendo un ping a bsd.smc.local o nextcloud.smc.local."
+
+      - echo "--- Tokens SMC 2FA ---"
+      - incus exec {{.INSTANCE_NAME}} -- sudo -u {{.US_SMC}} google-authenticator -t -d -f -r 3 -R 30 -w 3 -q
+      - incus exec {{.INSTANCE_NAME}} -- cat /home/{{.US_SMC}}/.google_authenticator | head -n 1
+
+      - echo "--- Tokens BSD 2FA ---"
+      - incus exec {{.BASE_DATOS}} -- sudo -u {{.US_BSD}} google-authenticator -t -d -f -r 3 -R 30 -w 3 -q
+      - incus exec {{.BASE_DATOS}} -- cat /home/{{.US_BSD}}/.google_authenticator | head -n 1
+
+      - echo "-- Recuerda que tienes que tener agregado de servidor DNS en el adaptador de red el servidor SMC --"
+      - echo "-- Sustituye el alias por la IP del servidor SMC si no quieres hacer el cambio en el adaptador de red --"
+      - echo "Pagina Bootstrap Comporativa de SMC"
+      - echo "http://www.smc.local"
+      - echo "http://smc.smc.local"
+
+      - echo "Pagina Nextcloud"
+      - echo "http://nextcloud.smc.local/nextcloud"
+      - echo "http://smc.smc.local/nextcloud"
+
+      - echo "Grafana"
+      - echo "http://grafana.smc.local:3000"
+      - echo "Prometheus"
+      - echo "http://prometheus.smc.local:9090"
+
+      - echo "Usuario y contraseña de SMC"
+      - 'echo "Usuario: {{.US_SMC}}"'
+      - 'echo "Password: {{.PASS_SMC}}"'
+
+      - echo "Usuario y contraseña de BSD"
+      - 'echo "Usuario: {{.US_BSD}}"'
+      - 'echo "Password: {{.PASS_BSD}}"'
+
+      - echo "Usuario y contraseña para FTP"
+      - 'echo "Usuario: {{.USER_FTP}}"'
+      - 'echo "Password: {{.PASS_FTP}}"'
+
+      - echo "Contraseñas para Nextcloud para Base de Datos"
+      - 'echo "Usuario: {{.NC_DB_USER}}"'
+      - 'echo "Password: {{.NC_DB_PASS}}"'
+
+      - echo "Usuario Admin de Nextcloud Web"
+      - 'echo "Usuario: {{.NC_ADMIN_USER}}"'
+      - 'echo "Password: {{.NC_ADMIN_PASS}}"'
+
+  clean:
+    ignore_error: true
+    desc: Clean activity files and set up
+    prompt: This will delete all the files and activity tasks done... Do you want to continue?
+    cmds: []
