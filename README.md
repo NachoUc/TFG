@@ -5,10 +5,12 @@ Se ha desarrollado una Infraestructura como Código (IaC) totalmente automatizad
 ##Pasos para desplegar el servicio y hacer las correctas comprobaciones:
 ### Cómo activar o desactivar la versión de Taskfile para servidor en nube con redundancia o local:
 <img width="462" height="312" alt="image" src="https://github.com/user-attachments/assets/27063aeb-ca0f-4a2c-ae7e-38c0c3738a62" />
+
 Sí el servidor ya tiene redundancia dejaremos el comentario puesto, en caso contrario quitamos el comentario; El RAID solo funcionara en el servidor de base de datos.
 
 ### Cómo cambiar las contraseñas y usuarios utilizados para los contenedores y servicios:
 <img width="627" height="525" alt="image" src="https://github.com/user-attachments/assets/7b3609e9-1044-44b2-8777-494c7f1fc84d" />
+
 Hay que cambiar SOLO, el valor de la variable del principio del documento.
 
 ### Pasos para instalar correctamente los servicios necesarios para el Taskfile:
