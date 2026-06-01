@@ -13,7 +13,7 @@ vars:
   PASS_BSD: admin123
 
 #Nomnbre del dominio
-  DOMAIN: "smc.local"
+  DOMAIN: "smc.lan"
 
 #Usuario y contraseña para FTP
   USER_FTP: "smc_admin"
@@ -23,9 +23,9 @@ vars:
   CHROOT_PATH: "/srv/sftp"
 
 #Contraseñas para Nextcloud para Base de Datos y Admin en la pagina web
-  NC_DB_USER: "nc_admin"
+  NC_DB_USER: "ncx_admin"
   NC_DB_PASS: "admin123"
-  NC_ADMIN_USER: "admin"
+  NC_ADMIN_USER: "adminc"
   NC_ADMIN_PASS: "admin123"
 
 tasks:
@@ -358,8 +358,8 @@ tasks:
       - echo "Instalando Nextcloud..."
       - incus exec {{.INSTANCE_NAME}} -- bash -c 'sudo -u www-data php /var/www/html/nextcloud/occ maintenance:install --database "mysql" --database-name "nextcloud" --database-user "{{.NC_DB_USER}}" --database-pass "{{.NC_DB_PASS}}" --database-host "bsd.smc.local" --admin-user "{{.NC_ADMIN_USER}}" --admin-pass "{{.NC_ADMIN_PASS}}" --data-dir "/var/www/html/nextcloud/data"'
 
-      - incus exec {{.INSTANCE_NAME}} -- bash -c 'sudo -u www-data php /var/www/html/nextcloud/occ config:system:set trusted_domains 1 --value=nextcloud.smc.local'
-      - incus exec {{.INSTANCE_NAME}} -- bash -c 'sudo -u www-data php /var/www/html/nextcloud/occ config:system:set trusted_domains 2 --value=smc.smc.local'
+      - incus exec {{.INSTANCE_NAME}} -- bash -c 'sudo -u www-data php /var/www/html/nextcloud/occ config:system:set trusted_domains 1 --value=nextcloud.smc.lan'
+      - incus exec {{.INSTANCE_NAME}} -- bash -c 'sudo -u www-data php /var/www/html/nextcloud/occ config:system:set trusted_domains 2 --value=smc.smc.lan'
       - incus exec {{.INSTANCE_NAME}} -- bash -c 'IP=$(hostname -I | cut -d" " -f1); sudo -u www-data php /var/www/html/nextcloud/occ config:system:set trusted_domains 3 --value=$IP'
       - incus exec {{.INSTANCE_NAME}} -- systemctl restart apache2
       - 'echo "Nextcloud listo en http://nextcloud.smc.local/nextcloud"'
@@ -840,12 +840,12 @@ tasks:
       - echo "-- Recuerda que tienes que tener agregado de servidor DNS en el adaptador de red el servidor SMC --"
       - echo "-- Sustituye el alias por la IP del servidor SMC si no quieres hacer el cambio en el adaptador de red --"
       - echo "Pagina Bootstrap Comporativa de SMC"
-      - echo "http://www.smc.local"
-      - echo "http://smc.smc.local"
+      - echo "http://www.smc.lan"
+      - echo "http://smc.smc.lan"
 
       - echo "Pagina Nextcloud"
       - echo "http://nextcloud.smc.local/nextcloud"
-      - echo "http://smc.smc.local/nextcloud"
+      - echo "http://smc.smc.lan/nextcloud"
 
       - echo "Grafana"
       - echo "http://grafana.smc.local:3000"
