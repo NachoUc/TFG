@@ -34,7 +34,7 @@ Página Nextcloud
 - http://nextcloud.smc.local/nextcloud
 - http://smc.smc.local/nextcloud
 
-Directorio de script para crear usuarios y backup
+Directorio de scripts para crear usuarios y backup
 - /usr/local/bin/
 
 Grafana
